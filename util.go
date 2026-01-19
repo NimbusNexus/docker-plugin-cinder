@@ -23,7 +23,6 @@ var filesystems []string = []string{
 	"xfs",
 }
 
-// --- перевірка наявності елемента у слайсі ---
 func contains(slice []string, x string) bool {
 	for _, s := range slice {
 		if s == x {
@@ -33,7 +32,6 @@ func contains(slice []string, x string) bool {
 	return false
 }
 
-// --- визначення filesystem ---
 func getFilesystemType(dev string) (string, error) {
 	out, err := exec.Command("blkid", "-s", "TYPE", "-o", "value", dev).CombinedOutput()
 	if err != nil {
@@ -45,7 +43,6 @@ func getFilesystemType(dev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// --- форматування файлової системи ---
 func formatFilesystem(dev, label, filesystem string) error {
 	if !contains(filesystems, filesystem) {
 		return fmt.Errorf("filesystem '%s' does not exist", filesystem)
@@ -64,7 +61,6 @@ func formatFilesystem(dev, label, filesystem string) error {
 	return nil
 }
 
-// --- знайти новий блок-диск ---
 func findDeviceWithTimeout(existing []string) (string, error) {
     log.Infof("Starting device search. Existing devices: %v", existing)
 
@@ -75,7 +71,6 @@ func findDeviceWithTimeout(existing []string) (string, error) {
 
         var newDevices []string
         for _, d := range devices {
-            // Перевіряємо чи це не партиція
             isPartition := strings.HasSuffix(d, "1") ||
                           strings.HasSuffix(d, "2") ||
                           strings.HasSuffix(d, "3") ||
@@ -102,7 +97,6 @@ func findDeviceWithTimeout(existing []string) (string, error) {
     return "", fmt.Errorf("block device not found")
 }
 
-// --- перевірка наявності директорії ---
 func isDirectoryPresent(path string) (bool, error) {
 	stat, err := os.Stat(path)
 	if os.IsNotExist(err) {

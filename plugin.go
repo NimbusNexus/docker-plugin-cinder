@@ -31,7 +31,6 @@ type plugin struct {
 	mutex         *sync.Mutex
 }
 
-// --- Plugin constructor ---
 func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.EndpointOpts, config *tConfig) (*plugin, error) {
 	blockClient, err := openstack.NewBlockStorageV3(provider, endpointOpts)
 	if err != nil {
@@ -63,14 +62,12 @@ func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.En
 	}, nil
 }
 
-// --- Docker plugin capabilities ---
 func (d plugin) Capabilities() *volume.CapabilitiesResponse {
 	return &volume.CapabilitiesResponse{
 		Capabilities: volume.Capability{Scope: "global"},
 	}
 }
 
-// --- Create volume ---
 func (d plugin) Create(r *volume.CreateRequest) error {
 	logger := log.WithFields(log.Fields{"name": r.Name, "action": "create"})
 	logger.Infof("Creating volume '%s' ...", r.Name)
@@ -148,7 +145,6 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         return nil, fmt.Errorf("Volume not found: %v", err)
     }
 
-    // ⚠️ Зберігаємо список пристроїв ДО attach
     existing, _ := filepath.Glob("/dev/vd*")
     logger.Infof("Devices before attach: %v", existing)
 
@@ -174,7 +170,6 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     logger.Infof("Searching for new block device...")
     dev, err := findDeviceWithTimeout(existing)
     if err != nil {
-        // Додатково виведемо поточний список пристроїв
         current, _ := filepath.Glob("/dev/vd*")
         logger.Errorf("Failed to find device. Before: %v, After: %v", existing, current)
         return nil, fmt.Errorf("Block device not found for volume %s", vol.ID)
@@ -211,7 +206,6 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     return &volume.MountResponse{Mountpoint: mountPath}, nil
 }
 
-// --- Допоміжна функція: знайти новий диск ---
 func findNewDevice(existing []string) (string, error) {
 	for i := 0; i < 20; i++ {
 		time.Sleep(500 * time.Millisecond)
@@ -227,14 +221,12 @@ func findNewDevice(existing []string) (string, error) {
 	return "", errors.New("block device not found")
 }
 
-// --- Path ---
 func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 	return &volume.PathResponse{
 		Mountpoint: filepath.Join(d.config.MountDir, r.Name),
 	}, nil
 }
 
-// --- Remove volume ---
 func (d plugin) Remove(r *volume.RemoveRequest) error {
 	ctx := context.TODO()
 	vol, err := d.getByName(r.Name)
@@ -251,7 +243,6 @@ func (d plugin) Remove(r *volume.RemoveRequest) error {
 	return volumes.Delete(ctx, d.blockClient, vol.ID, volumes.DeleteOpts{}).ExtractErr()
 }
 
-// --- Unmount volume ---
 func (d plugin) Unmount(r *volume.UnmountRequest) error {
 	ctx := context.TODO()
 	d.mutex.Lock()
@@ -279,7 +270,6 @@ func (d plugin) Unmount(r *volume.UnmountRequest) error {
 	return nil
 }
 
-// --- Helper: get volume by name ---
 func (d plugin) getByName(name string) (*volumes.Volume, error) {
 	var vol *volumes.Volume
 	ctx := context.TODO()
@@ -301,7 +291,6 @@ func (d plugin) getByName(name string) (*volumes.Volume, error) {
 	return vol, err
 }
 
-// --- Helper: detach volume ---
 func (d plugin) detachVolume(ctx context.Context, vol *volumes.Volume) (*volumes.Volume, error) {
 	for _, att := range vol.Attachments {
 		if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
@@ -311,7 +300,6 @@ func (d plugin) detachVolume(ctx context.Context, vol *volumes.Volume) (*volumes
 	return vol, nil
 }
 
-// --- Helper: wait for status ---
 func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, status string) (*volumes.Volume, error) {
 	if vol.Status == status {
 		return vol, nil

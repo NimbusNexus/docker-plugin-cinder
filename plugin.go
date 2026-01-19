@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,36 +31,28 @@ type plugin struct {
 	mutex         *sync.Mutex
 }
 
+// --- Plugin constructor ---
 func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.EndpointOpts, config *tConfig) (*plugin, error) {
 	blockClient, err := openstack.NewBlockStorageV3(provider, endpointOpts)
-
 	if err != nil {
 		return nil, err
 	}
 
 	computeClient, err := openstack.NewComputeV2(provider, endpointOpts)
-
 	if err != nil {
 		return nil, err
 	}
 
-	if len(config.MachineID) == 0 {
+	if config.MachineID == "" {
 		bytes, err := os.ReadFile("/etc/machine-id")
 		if err != nil {
-			log.WithError(err).Error("Error reading machine id")
 			return nil, err
 		}
-
-		uuid, err := uuid.FromString(strings.TrimSpace(string(bytes)))
+		id, err := uuid.FromString(strings.TrimSpace(string(bytes)))
 		if err != nil {
-			log.WithError(err).Error("Error parsing machine id")
 			return nil, err
 		}
-
-		log.WithField("id", uuid).Info("Machine ID detected")
-		config.MachineID = uuid.String()
-	} else {
-		log.WithField("id", config.MachineID).Debug("Using configured machine ID")
+		config.MachineID = id.String()
 	}
 
 	return &plugin{
@@ -72,432 +63,282 @@ func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.En
 	}, nil
 }
 
+// --- Docker plugin capabilities ---
 func (d plugin) Capabilities() *volume.CapabilitiesResponse {
 	return &volume.CapabilitiesResponse{
 		Capabilities: volume.Capability{Scope: "global"},
 	}
 }
 
+// --- Create volume ---
 func (d plugin) Create(r *volume.CreateRequest) error {
 	logger := log.WithFields(log.Fields{"name": r.Name, "action": "create"})
 	logger.Infof("Creating volume '%s' ...", r.Name)
-	logger.Debugf("Create: %+v", r)
 
 	ctx := context.TODO()
-
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// DEFAULT SIZE IN GB
-	var size = 10
-	var filesystem = "ext4"
-	var err error
-
+	// DEFAULTS
+	size := 10
 	if s, ok := r.Options["size"]; ok {
-		size, err = strconv.Atoi(s)
-		if err != nil {
-			logger.WithError(err).Error("Error parsing size option")
-			return fmt.Errorf("Invalid size option: %s", err.Error())
+		if v, err := strconv.Atoi(s); err == nil {
+			size = v
 		}
 	}
 
-	if f, ok := r.Options["type"]; ok {
-		f = strings.ToLower(f)
-		if !slices.Contains(filesystems, f) {
-			logger.WithError(err).Error("Error parsing filesystem type option")
-			return fmt.Errorf("Invalid filesystem option: %s", f)
-		}
-		filesystem = f
-	}
-
-	vol, err := volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
+	// Create volume only (do not attach yet)
+	_, err := volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
 		Size: size,
 		Name: r.Name,
 	}, volumes.SchedulerHintOpts{}).Extract()
-
 	if err != nil {
-		logger.WithError(err).Errorf("Error creating volume: %s", err.Error())
-		return err
+		return fmt.Errorf("Volume create failed: %v", err)
 	}
 
-	//
-	// Attaching block volume to compute instance
-
-	opts := volumeattach.CreateOpts{VolumeID: vol.ID}
-	_, err = volumeattach.Create(ctx, d.computeClient, d.config.MachineID, opts).Extract()
-
-	if err != nil {
-		logger.WithError(err).Errorf("Error attaching volume: %s", err.Error())
-		return err
-	}
-
-	//
-	// Waiting for device appearance
-
-	dev, err := findDeviceWithTimeout()
-
-	if err != nil {
-		logger.WithError(err).Error("Block device not found")
-		return err
-	}
-
-	logger.WithField("dev", dev).Debug("Found device")
-
-	logger.Debug("Volume is empty, formatting")
-	if err := formatFilesystem(dev, r.Name, filesystem); err != nil {
-		logger.WithError(err).Error("Formatting failed")
-		return err
-	}
-
-	logger.WithField("id", vol.ID).Debug("Volume created")
-
+	logger.Infof("Volume '%s' created (available)", r.Name)
 	return nil
 }
 
+// --- Get volume ---
 func (d plugin) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
-	logger := log.WithFields(log.Fields{"name": r.Name, "action": "get"})
-	logger.Debugf("Get: %+v", r)
-
 	vol, err := d.getByName(r.Name)
-
 	if err != nil {
-		logger.WithError(err).Errorf("Error retriving volume: %s", err.Error())
 		return nil, err
 	}
 
-	response := &volume.GetResponse{
+	return &volume.GetResponse{
 		Volume: &volume.Volume{
 			Name:       r.Name,
 			CreatedAt:  vol.CreatedAt.Format(time.RFC3339),
 			Mountpoint: filepath.Join(d.config.MountDir, r.Name),
 		},
-	}
-
-	return response, nil
+	}, nil
 }
 
+// --- List volumes ---
 func (d plugin) List() (*volume.ListResponse, error) {
-	logger := log.WithFields(log.Fields{"action": "list"})
-	logger.Debugf("List")
-
 	ctx := context.TODO()
-
 	var vols []*volume.Volume
 
 	pager := volumes.List(d.blockClient, volumes.ListOpts{})
-	err := pager.EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+	_ = pager.EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 		vList, _ := volumes.ExtractVolumes(page)
-
 		for _, v := range vList {
-			if len(v.Name) > 0 {
+			if v.Name != "" {
 				vols = append(vols, &volume.Volume{
 					Name:      v.Name,
 					CreatedAt: v.CreatedAt.Format(time.RFC3339),
 				})
 			}
 		}
-
 		return true, nil
 	})
-
-	if err != nil {
-		logger.WithError(err).Errorf("Error listing volume: %s", err.Error())
-		return nil, err
-	}
 
 	return &volume.ListResponse{Volumes: vols}, nil
 }
 
+// --- Mount volume ---
 func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
-	logger := log.WithFields(log.Fields{"name": r.Name, "action": "mount"})
-	logger.Infof("Mounting volume '%s' ...", r.Name)
-	logger.Debugf("Mount: %+v", r)
+    logger := log.WithFields(log.Fields{"name": r.Name, "action": "mount"})
+    logger.Infof("Mounting volume '%s'", r.Name)
 
-	ctx := context.TODO()
+    vol, err := d.getByName(r.Name)
+    if err != nil {
+        return nil, fmt.Errorf("Volume not found: %v", err)
+    }
 
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
+    // ⚠️ Зберігаємо список пристроїв ДО attach
+    existing, _ := filepath.Glob("/dev/vd*")
+    logger.Infof("Devices before attach: %v", existing)
 
-	vol, err := d.getByName(r.Name)
-	if err != nil {
-		logger.WithError(err).Errorf("Error retriving volume: %s", err.Error())
-		return nil, err
-	}
+    // Attach only if not attached
+    if len(vol.Attachments) == 0 {
+        logger.Infof("Attaching volume %s to instance %s", vol.ID, d.config.MachineID)
+        opts := volumeattach.CreateOpts{VolumeID: vol.ID}
+        _, err := volumeattach.Create(context.TODO(), d.computeClient, d.config.MachineID, opts).Extract()
+        if err != nil {
+            return nil, fmt.Errorf("Attach failed: %v", err)
+        }
 
-	logger = logger.WithField("id", vol.ID)
+        logger.Infof("Waiting for volume to reach 'in-use' state")
+        vol, err = d.waitOnVolumeState(context.TODO(), vol, "in-use")
+        if err != nil {
+            return nil, fmt.Errorf("Timeout waiting for volume to attach: %v", err)
+        }
+        logger.Infof("Volume %s is now in-use", vol.ID)
+    } else {
+        logger.Infof("Volume %s already attached", vol.ID)
+    }
 
-	if vol.Status == "creating" || vol.Status == "detaching" {
-		logger.Infof("Volume is in '%s' state, wait for 'available'...", vol.Status)
-		if vol, err = d.waitOnVolumeState(ctx, vol, "available"); err != nil {
-			logger.Error(err.Error())
-			return nil, err
-		}
-	}
+    logger.Infof("Searching for new block device...")
+    dev, err := findDeviceWithTimeout(existing)
+    if err != nil {
+        // Додатково виведемо поточний список пристроїв
+        current, _ := filepath.Glob("/dev/vd*")
+        logger.Errorf("Failed to find device. Before: %v, After: %v", existing, current)
+        return nil, fmt.Errorf("Block device not found for volume %s", vol.ID)
+    }
 
-	if vol, err = volumes.Get(ctx, d.blockClient, vol.ID).Extract(); err != nil {
-		return nil, err
-	}
+    logger.Infof("Found device: %s", dev)
 
-	if len(vol.Attachments) > 0 {
-		logger.Debug("Volume already attached, detaching first")
-		if vol, err = d.detachVolume(ctx, vol); err != nil {
-			logger.WithError(err).Error("Error detaching volume")
-			return nil, err
-		}
+    fsType, err := getFilesystemType(dev)
+    if err != nil {
+        return nil, fmt.Errorf("Detecting filesystem failed: %v", err)
+    }
 
-		if vol, err = d.waitOnVolumeState(ctx, vol, "available"); err != nil {
-			logger.WithError(err).Error("Error detaching volume")
-			return nil, err
-		}
-	}
+    if fsType == "" {
+        logger.Infof("Formatting device %s as ext4", dev)
+        if err := formatFilesystem(dev, r.Name, "ext4"); err != nil {
+            return nil, fmt.Errorf("Formatting failed: %v", err)
+        }
+    } else {
+        logger.Infof("Device %s already has filesystem: %s", dev, fsType)
+    }
 
-	if vol.Status != "available" {
-		logger.Debugf("Volume: %+v\n", vol)
-		logger.Errorf("Invalid volume state for mounting: %s", vol.Status)
-		return nil, errors.New("Invalid Volume State")
-	}
+    mountPath := filepath.Join(d.config.MountDir, r.Name)
+    if err = os.MkdirAll(mountPath, 0700); err != nil {
+        return nil, fmt.Errorf("Cannot create mount path: %v", err)
+    }
 
-	//
-	// Attaching block volume to compute instance
+    logger.Infof("Mounting %s to %s", dev, mountPath)
+    out, err := exec.Command("mount", dev, mountPath).CombinedOutput()
+    if err != nil {
+        return nil, fmt.Errorf("Mount failed: %s", out)
+    }
 
-	opts := volumeattach.CreateOpts{VolumeID: vol.ID}
-	_, err = volumeattach.Create(ctx, d.computeClient, d.config.MachineID, opts).Extract()
-
-	if err != nil {
-		logger.WithError(err).Errorf("Error attaching volume: %s", err.Error())
-		return nil, err
-	}
-
-	//
-	// Waiting for device appearance
-
-	logger.Debug("Waiting for device to appear...")
-
-	dev, err := findDeviceWithTimeout()
-
-	if err != nil {
-		logger.WithError(err).Error("Block device not found")
-		return nil, err
-	}
-
-	logger.WithField("dev", dev).Debug("Found device")
-
-	//
-	// Check filesystem and format if necessary
-
-	fsType, err := getFilesystemType(dev)
-	if err != nil {
-		logger.WithError(err).Error("Detecting filesystem type failed")
-		return nil, err
-	}
-
-	if fsType == "" {
-		logger.Debug("Volume is empty, formatting")
-		if err := formatFilesystem(dev, r.Name, "ext4"); err != nil {
-			logger.WithError(err).Error("Formatting failed")
-			return nil, err
-		}
-	}
-
-	//
-	// Mount device
-
-	path := filepath.Join(d.config.MountDir, r.Name)
-	if err = os.MkdirAll(path, 0700); err != nil {
-		logger.WithError(err).Error("Error creating mount directory")
-		return nil, err
-	}
-
-	logger.WithField("mount", path).Debug("Mounting volume...")
-	out, err := exec.Command("mount", dev, path).CombinedOutput()
-	if err != nil {
-		log.WithError(err).Errorf("%s", out)
-		return nil, errors.New(string(out))
-	}
-
-	resp := volume.MountResponse{
-		Mountpoint: path,
-	}
-
-	logger.Debug("Volume successfully mounted")
-
-	return &resp, nil
+    logger.Infof("Volume '%s' mounted successfully at %s", r.Name, mountPath)
+    return &volume.MountResponse{Mountpoint: mountPath}, nil
 }
 
+// --- Допоміжна функція: знайти новий диск ---
+func findNewDevice(existing []string) (string, error) {
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		devices, _ := filepath.Glob("/dev/vd*")
+
+		for _, d := range devices {
+			if !contains(existing, d) && !strings.HasSuffix(d, "1") &&
+				!strings.HasSuffix(d, "2") && !strings.HasSuffix(d, "3") && !strings.HasSuffix(d, "4") {
+				return d, nil
+			}
+		}
+	}
+	return "", errors.New("block device not found")
+}
+
+// --- Path ---
 func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
-	logger := log.WithFields(log.Fields{"name": r.Name, "action": "path"})
-	logger.Debugf("Path: %+v", r)
-
-	resp := volume.PathResponse{
+	return &volume.PathResponse{
 		Mountpoint: filepath.Join(d.config.MountDir, r.Name),
-	}
-
-	return &resp, nil
+	}, nil
 }
 
+// --- Remove volume ---
 func (d plugin) Remove(r *volume.RemoveRequest) error {
-	logger := log.WithFields(log.Fields{"name": r.Name, "action": "remove"})
-	logger.Infof("Removing volume '%s' ...", r.Name)
-	logger.Debugf("Remove: %+v", r)
-
 	ctx := context.TODO()
-
 	vol, err := d.getByName(r.Name)
-
 	if err != nil {
-		logger.WithError(err).Errorf("Error retriving volume: %s", err.Error())
 		return err
 	}
 
-	logger = logger.WithField("id", vol.ID)
-
 	if len(vol.Attachments) > 0 {
-		logger.Debug("Volume still attached, detaching first")
-		if vol, err = d.detachVolume(ctx, vol); err != nil {
-			logger.WithError(err).Error("Error detaching volume")
+		if _, err := d.detachVolume(ctx, vol); err != nil {
 			return err
 		}
 	}
 
-	logger.Debug("Deleting block volume...")
-
-	err = volumes.Delete(ctx, d.blockClient, vol.ID, volumes.DeleteOpts{}).ExtractErr()
-	if err != nil {
-		logger.WithError(err).Errorf("Error deleting volume: %s", err.Error())
-		return err
-	}
-
-	logger.Debug("Volume deleted")
-
-	return nil
+	return volumes.Delete(ctx, d.blockClient, vol.ID, volumes.DeleteOpts{}).ExtractErr()
 }
 
+// --- Unmount volume ---
 func (d plugin) Unmount(r *volume.UnmountRequest) error {
-	logger := log.WithFields(log.Fields{"name": r.Name, "action": "unmount"})
-	logger.Infof("Unmounting volume '%s' ...", r.Name)
-	logger.Debugf("Unmount: %+v", r)
-
 	ctx := context.TODO()
-
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	path := filepath.Join(d.config.MountDir, r.Name)
-	exists, err := isDirectoryPresent(path)
-	if err != nil {
-		logger.WithError(err).Errorf("Error checking directory stat: %s", path)
-	}
-
-	if exists {
-		err = syscall.Unmount(path, 0)
-		if err != nil {
-			logger.WithError(err).Errorf("Error unmount %s", path)
-		}
+	mountPath := filepath.Join(d.config.MountDir, r.Name)
+	if _, err := os.Stat(mountPath); err == nil {
+		_ = syscall.Unmount(mountPath, 0)
 	}
 
 	vol, err := d.getByName(r.Name)
 	if err != nil {
-		logger.WithError(err).Error("Error retriving volume")
-	} else {
-		_, err = d.detachVolume(ctx, vol)
-		if err != nil {
-			logger.WithError(err).Error("Error detaching volume")
+		return err
+	}
+
+	if len(vol.Attachments) > 0 {
+		if _, err := d.detachVolume(ctx, vol); err != nil {
+			return err
+		}
+		if _, err := d.waitOnVolumeState(ctx, vol, "available"); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
+// --- Helper: get volume by name ---
 func (d plugin) getByName(name string) (*volumes.Volume, error) {
-	var volume *volumes.Volume
-
+	var vol *volumes.Volume
 	ctx := context.TODO()
-
 	pager := volumes.List(d.blockClient, volumes.ListOpts{Name: name})
 	err := pager.EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
-		vList, err := volumes.ExtractVolumes(page)
-
-		if err != nil {
-			return false, err
-		}
-
+		vList, _ := volumes.ExtractVolumes(page)
 		for _, v := range vList {
 			if v.Name == name {
-				volume = &v
+				vol = &v
 				return false, nil
 			}
 		}
-
 		return true, nil
 	})
 
-	if len(volume.ID) == 0 {
+	if vol == nil || vol.ID == "" {
 		return nil, errors.New("Not Found")
 	}
-
-	return volume, err
+	return vol, err
 }
 
+// --- Helper: detach volume ---
 func (d plugin) detachVolume(ctx context.Context, vol *volumes.Volume) (*volumes.Volume, error) {
 	for _, att := range vol.Attachments {
-		err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr()
-		if err != nil {
+		if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
 			return nil, err
 		}
 	}
-
 	return vol, nil
 }
 
-func (d plugin) waitOnVolumeState(
-    ctx context.Context,
-    vol *volumes.Volume,
-    status string,
-) (*volumes.Volume, error) {
+// --- Helper: wait for status ---
+func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, status string) (*volumes.Volume, error) {
+	if vol.Status == status {
+		return vol, nil
+	}
 
-    if vol.Status == status {
-        return vol, nil
-    }
+	timeout := time.After(60 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-    timeout := time.After(60 * time.Second)
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return nil, ctx.Err()
-
-        case <-timeout:
-            return vol, fmt.Errorf(
-                "volume %s did not reach status %s (last=%s)",
-                vol.ID, status, vol.Status,
-            )
-
-        case <-ticker.C:
-            updated, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
-            if err != nil {
-                return nil, err
-            }
-
-            vol = updated
-
-            log.Debugf(
-                "Waiting for volume %s: current=%s, desired=%s",
-                vol.ID, vol.Status, status,
-            )
-
-            if vol.Status == status {
-                return vol, nil
-            }
-
-            if status == "in-use" && vol.Status == "available" {
-                log.Warnf(
-                    "Volume %s is still available while waiting for in-use, continuing",
-                    vol.ID,
-                )
-            }
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeout:
+			return vol, fmt.Errorf("volume %s did not reach status %s (last=%s)", vol.ID, status, vol.Status)
+		case <-ticker.C:
+			updated, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
+			if err != nil {
+				return nil, err
+			}
+			vol = updated
+			if vol.Status == status {
+				return vol, nil
+			}
+			if status == "in-use" && vol.Status == "available" {
+				log.Warnf("Volume %s still available while waiting for in-use, continuing", vol.ID)
+			}
+		}
+	}
 }
-

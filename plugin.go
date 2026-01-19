@@ -134,7 +134,7 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 	//
 	// Waiting for device appearance
 
-	dev, err := findDeviceWithTimeout(vol.ID)
+	dev, err := findDeviceWithTimeout()
 
 	if err != nil {
 		logger.WithError(err).Error("Block device not found")
@@ -273,7 +273,7 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 
 	logger.Debug("Waiting for device to appear...")
 
-	dev, err := findDeviceWithTimeout(vol.ID)
+	dev, err := findDeviceWithTimeout()
 
 	if err != nil {
 		logger.WithError(err).Error("Block device not found")

@@ -103,6 +103,21 @@ func (d plugin) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
 		return nil, err
 	}
 
+    mountPath := filepath.Join(d.config.MountDir, r.Name)
+
+    mounted, _ := isMounted(mountPath)
+    if !mounted {
+        log.Warnf("Path() called but volume not mounted, attempting mount...")
+
+        _, err := d.Mount(&volume.MountRequest{
+            Name: r.Name,
+            ID:   r.Name,
+        })
+        if err != nil {
+            log.Errorf("Auto-mount from Path() failed: %v", err)
+        }
+    }
+
 	return &volume.GetResponse{
 		Volume: &volume.Volume{
 			Name:       r.Name,
@@ -134,10 +149,12 @@ func (d plugin) List() (*volume.ListResponse, error) {
 	return &volume.ListResponse{Volumes: vols}, nil
 }
 
-// --- Mount volume ---
 func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     logger := log.WithFields(log.Fields{"name": r.Name, "action": "mount"})
     logger.Infof("Mounting volume '%s'", r.Name)
+
+    d.mutex.Lock()
+    defer d.mutex.Unlock()
 
     vol, err := d.getByName(r.Name)
     if err != nil {
@@ -170,6 +187,9 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                 devicePath = attachment.Device
                 logger.Infof("Volume %s already attached to this instance as %s", vol.ID, devicePath)
                 break
+            } else {
+                logger.Warnf("Volume %s is attached to different instance: %s", vol.ID, attachment.ServerID)
+                return nil, fmt.Errorf("volume is attached to different instance")
             }
         }
     }
@@ -196,16 +216,13 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         if err != nil {
             current, _ := filepath.Glob("/dev/vd*")
             logger.Errorf("Failed to find device. Before: %v, After: %v", existing, current)
-            return nil, fmt.Errorf("Block device not found for volume %s", vol.ID)
+            return nil, fmt.Errorf("block device not found for volume %s: %v", vol.ID, err)
         }
-    } else {
-        // Device should already exist, verify it
-        if devicePath == "" {
-            // Try to find it
-            devicePath, err = findDeviceWithTimeout(existing)
-            if err != nil {
-                return nil, fmt.Errorf("Block device not found for attached volume %s", vol.ID)
-            }
+    } else if devicePath == "" {
+        logger.Infof("Finding existing device...")
+        devicePath, err = findDeviceWithTimeout(existing)
+        if err != nil {
+            return nil, fmt.Errorf("block device not found for attached volume %s: %v", vol.ID, err)
         }
     }
 
@@ -213,34 +230,51 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 
     fsType, err := getFilesystemType(devicePath)
     if err != nil {
-        return nil, fmt.Errorf("Detecting filesystem failed: %v", err)
+        return nil, fmt.Errorf("detecting filesystem failed: %v", err)
     }
 
     if fsType == "" {
         logger.Infof("Formatting device %s as ext4", devicePath)
         if err := formatFilesystem(devicePath, r.Name, "ext4"); err != nil {
-            return nil, fmt.Errorf("Formatting failed: %v", err)
+            return nil, fmt.Errorf("formatting failed: %v", err)
         }
     } else {
         logger.Infof("Device %s already has filesystem: %s", devicePath, fsType)
     }
 
-    if err = os.MkdirAll(mountPath, 0700); err != nil {
-    	return nil, fmt.Errorf("Cannot create mount path: %v", err)
-	}
+    if err = os.MkdirAll(mountPath, 0755); err != nil {
+        return nil, fmt.Errorf("cannot create mount path: %v", err)
+    }
 
-	logger.Infof("Mounting %s to %s", devicePath, mountPath)
-	if out, err := exec.Command("mount", devicePath, mountPath).CombinedOutput(); err != nil {
-		// Check if it's "already mounted" error
-		if strings.Contains(string(out), "already mounted") {
-			logger.Infof("Device already mounted, continuing...")
-			return &volume.MountResponse{Mountpoint: mountPath}, nil
-		}
-		return nil, fmt.Errorf("Mount failed: %s", out)
-	}
+    logger.Infof("Mounting %s to %s", devicePath, mountPath)
+    if out, err := exec.Command("mount", devicePath, mountPath).CombinedOutput(); err != nil {
+        if strings.Contains(string(out), "already mounted") {
+            logger.Infof("Device already mounted, continuing...")
+            return &volume.MountResponse{Mountpoint: mountPath}, nil
+        }
+        return nil, fmt.Errorf("mount failed: %s", out)
+    }
 
-	logger.Infof("Volume '%s' mounted successfully at %s", r.Name, mountPath)
-	return &volume.MountResponse{Mountpoint: mountPath}, nil
+    lostFoundPath := filepath.Join(mountPath, "lost+found")
+    if _, err := os.Stat(lostFoundPath); err == nil {
+        logger.Infof("Fixing permissions on lost+found directory")
+        if out, err := exec.Command("chmod", "777", lostFoundPath).CombinedOutput(); err != nil {
+            logger.Warnf("Failed to chmod lost+found: %s", out)
+        }
+        if out, err := exec.Command("rm", "-rf", lostFoundPath).CombinedOutput(); err != nil {
+            logger.Warnf("Failed to remove lost+found: %s", out)
+        } else {
+            logger.Infof("Removed lost+found directory")
+        }
+    }
+
+    logger.Infof("Setting permissions on mount point")
+    if out, err := exec.Command("chmod", "-R", "777", mountPath).CombinedOutput(); err != nil {
+        logger.Warnf("Failed to set permissions: %s", out)
+    }
+
+    logger.Infof("Volume '%s' mounted successfully at %s", r.Name, mountPath)
+    return &volume.MountResponse{Mountpoint: mountPath}, nil
 }
 
 // Helper function to check if path is mounted
@@ -274,25 +308,99 @@ func findNewDevice(existing []string) (string, error) {
 }
 
 func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
+    mountPath := filepath.Join(d.config.MountDir, r.Name)
+
+    mounted, _ := isMounted(mountPath)
+    if !mounted {
+        log.Warnf("Path() called but volume not mounted, attempting mount...")
+
+        _, err := d.Mount(&volume.MountRequest{
+            Name: r.Name,
+            ID:   r.Name,
+        })
+        if err != nil {
+            log.Errorf("Auto-mount from Path() failed: %v", err)
+        }
+    }
+
 	return &volume.PathResponse{
 		Mountpoint: filepath.Join(d.config.MountDir, r.Name),
 	}, nil
 }
 
 func (d plugin) Remove(r *volume.RemoveRequest) error {
-	ctx := context.TODO()
-	vol, err := d.getByName(r.Name)
-	if err != nil {
-		return err
-	}
+    logger := log.WithFields(log.Fields{"name": r.Name, "action": "remove"})
+    logger.Infof("Removing volume '%s'", r.Name)
 
-	if len(vol.Attachments) > 0 {
-		if _, err := d.detachVolume(ctx, vol); err != nil {
-			return err
-		}
-	}
+    ctx := context.TODO()
+    d.mutex.Lock()
+    defer d.mutex.Unlock()
 
-	return volumes.Delete(ctx, d.blockClient, vol.ID, volumes.DeleteOpts{}).ExtractErr()
+    vol, err := d.getByName(r.Name)
+    if err != nil {
+        logger.Warnf("Volume not found in OpenStack: %v", err)
+        return err
+    }
+
+    mountPath := filepath.Join(d.config.MountDir, r.Name)
+
+    mounted, err := isMounted(mountPath)
+    if err != nil {
+        logger.Warnf("Failed to check mount status: %v", err)
+    }
+
+    if mounted {
+        logger.Infof("Volume is mounted at %s, unmounting...", mountPath)
+        if out, err := exec.Command("umount", mountPath).CombinedOutput(); err != nil {
+            logger.Errorf("Unmount failed: %s", out)
+            logger.Infof("Attempting force unmount...")
+            if out, err := exec.Command("umount", "-f", mountPath).CombinedOutput(); err != nil {
+                logger.Errorf("Force unmount also failed: %s", out)
+                logger.Infof("Attempting lazy unmount...")
+                exec.Command("umount", "-l", mountPath).CombinedOutput()
+            }
+        } else {
+            logger.Infof("Successfully unmounted %s", mountPath)
+        }
+
+        if err := os.Remove(mountPath); err != nil {
+            logger.Warnf("Failed to remove mount directory: %v", err)
+        }
+    } else {
+        logger.Infof("Volume is not mounted, skipping unmount")
+    }
+
+    if len(vol.Attachments) > 0 {
+        logger.Infof("Volume has %d attachment(s), detaching...", len(vol.Attachments))
+
+        for _, att := range vol.Attachments {
+            logger.Infof("Detaching from server %s (attachment ID: %s)", att.ServerID, att.ID)
+            if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
+                logger.Errorf("Detach failed: %v", err)
+                return fmt.Errorf("failed to detach volume: %v", err)
+            }
+        }
+
+        logger.Infof("Waiting for volume to reach 'available' state...")
+        vol, err = d.waitOnVolumeState(ctx, vol, "available")
+        if err != nil {
+            logger.Errorf("Timeout waiting for available state: %v", err)
+            logger.Warnf("Continuing with delete despite state issue...")
+        } else {
+            logger.Infof("Volume is now available")
+        }
+    } else {
+        logger.Infof("Volume has no attachments")
+    }
+
+    logger.Infof("Deleting volume %s from OpenStack", vol.ID)
+    if err := volumes.Delete(ctx, d.blockClient, vol.ID, volumes.DeleteOpts{}).ExtractErr(); err != nil {
+        logger.Errorf("Delete failed: %v", err)
+        return fmt.Errorf("failed to delete volume: %v", err)
+    }
+
+    logger.Infof("Volume '%s' removed successfully", r.Name)
+    return nil
 }
 
 func (d plugin) Unmount(r *volume.UnmountRequest) error {
@@ -351,32 +459,37 @@ func (d plugin) detachVolume(ctx context.Context, vol *volumes.Volume) (*volumes
 }
 
 func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, status string) (*volumes.Volume, error) {
-	if vol.Status == status {
-		return vol, nil
-	}
+    if vol.Status == status {
+        return vol, nil
+    }
 
-	timeout := time.After(60 * time.Second)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+    timeout := time.After(60 * time.Second)
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timeout:
-			return vol, fmt.Errorf("volume %s did not reach status %s (last=%s)", vol.ID, status, vol.Status)
-		case <-ticker.C:
-			updated, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
-			if err != nil {
-				return nil, err
-			}
-			vol = updated
-			if vol.Status == status {
-				return vol, nil
-			}
-			if status == "in-use" && vol.Status == "available" {
-				log.Warnf("Volume %s still available while waiting for in-use, continuing", vol.ID)
-			}
-		}
-	}
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-timeout:
+            return vol, fmt.Errorf("volume %s did not reach status %s within 60s (last status: %s)",
+                vol.ID, status, vol.Status)
+        case <-ticker.C:
+            updated, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
+            if err != nil {
+                log.Warnf("Error getting volume status: %v", err)
+                continue
+            }
+            vol = updated
+            log.Debugf("Volume %s status: %s (waiting for %s)", vol.ID, vol.Status, status)
+
+            if vol.Status == status {
+                return vol, nil
+            }
+
+            if vol.Status == "error" {
+                return vol, fmt.Errorf("volume %s entered error state", vol.ID)
+            }
+        }
+    }
 }

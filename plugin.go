@@ -183,33 +183,28 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 
 // --- Get volume ---
 func (d plugin) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
-	vol, err := d.getByName(r.Name)
-	if err != nil {
-		return nil, err
-	}
+    vol, err := d.getByName(r.Name)
+    if err != nil {
+        return nil, err
+    }
 
     mountPath := filepath.Join(d.config.MountDir, r.Name)
 
     mounted, _ := isMounted(mountPath)
-    if !mounted {
-        log.Warnf("Path() called but volume not mounted, attempting mount...")
-
-        _, err := d.Mount(&volume.MountRequest{
-            Name: r.Name,
-            ID:   r.Name,
-        })
+    if !mounted && !d.isNodeDrain() {  // ← не монтуємо якщо Drain
+        _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
         if err != nil {
-            log.Errorf("Auto-mount from Path() failed: %v", err)
+            log.Errorf("Auto-mount from Get() failed: %v", err)
         }
     }
 
-	return &volume.GetResponse{
-		Volume: &volume.Volume{
-			Name:       r.Name,
-			CreatedAt:  vol.CreatedAt.Format(time.RFC3339),
-			Mountpoint: filepath.Join(d.config.MountDir, r.Name),
-		},
-	}, nil
+    return &volume.GetResponse{
+        Volume: &volume.Volume{
+            Name:       r.Name,
+            CreatedAt:  vol.CreatedAt.Format(time.RFC3339),
+            Mountpoint: filepath.Join(d.config.MountDir, r.Name),
+        },
+    }, nil
 }
 
 // --- List volumes ---
@@ -505,25 +500,34 @@ func isMounted(path string) (bool, error) {
     return true, nil
 }
 
+func (d plugin) isNodeDrain() bool {
+    out, err := exec.Command("docker", "info", "--format", "{{.Swarm.NodeID}}").Output()
+    if err != nil {
+        return false
+    }
+    nodeID := strings.TrimSpace(string(out))
+
+    out, err = exec.Command("docker", "node", "inspect", nodeID, "--format", "{{.Spec.Availability}}").Output()
+    if err != nil {
+        return false
+    }
+    return strings.TrimSpace(string(out)) == "drain"
+}
+
 func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
     mountPath := filepath.Join(d.config.MountDir, r.Name)
 
     mounted, _ := isMounted(mountPath)
-    if !mounted {
-        log.Warnf("Path() called but volume not mounted, attempting mount...")
-
-        _, err := d.Mount(&volume.MountRequest{
-            Name: r.Name,
-            ID:   r.Name,
-        })
+    if !mounted && !d.isNodeDrain() {
+        _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
         if err != nil {
             log.Errorf("Auto-mount from Path() failed: %v", err)
         }
     }
 
-	return &volume.PathResponse{
-		Mountpoint: filepath.Join(d.config.MountDir, r.Name),
-	}, nil
+    return &volume.PathResponse{
+        Mountpoint: mountPath,
+    }, nil
 }
 
 func (d plugin) Remove(r *volume.RemoveRequest) error {

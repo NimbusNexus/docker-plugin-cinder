@@ -167,6 +167,19 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 		"docker_volume": "true",
 	}
 
+	if metaStr, ok := r.Options["meta"]; ok && metaStr != "" {
+        for _, pair := range strings.Split(metaStr, ",") {
+            parts := strings.SplitN(pair, "=", 2)
+            if len(parts) == 2 {
+                key := strings.TrimSpace(parts[0])
+                val := strings.TrimSpace(parts[1])
+                if key != "" {
+                    metadata[key] = val
+                }
+            }
+        }
+    }
+
 	// Create volume only (do not attach yet)
 	_, err = volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
 		Size: size,
@@ -191,7 +204,7 @@ func (d plugin) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
     mountPath := filepath.Join(d.config.MountDir, r.Name)
 
     mounted, _ := isMounted(mountPath)
-    if !mounted && !d.isNodeDrain() {  // ← не монтуємо якщо Drain
+    if !mounted && !d.isNodeDrain() {
         _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
         if err != nil {
             log.Errorf("Auto-mount from Get() failed: %v", err)

@@ -233,17 +233,34 @@ func (d plugin) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
 
     mounted, _ := isMounted(mountPath)
     if !mounted && !d.isNodeDrain() {
-        _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
-        if err != nil {
-            log.Errorf("Auto-mount from Get() failed: %v", err)
+        if len(vol.Attachments) == 0 {
+            _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
+            if err != nil {
+                log.Errorf("Auto-mount from Get() failed: %v", err)
+            }
+        } else {
+            log.Infof("Volume %s is attached to another server, skipping auto-mount", r.Name)
         }
     }
+
+	status := make(map[string]interface{})
+
+    if vol.Metadata != nil {
+        for key, value := range vol.Metadata {
+            status[key] = value
+        }
+    }
+
+    status["actual_size"] = fmt.Sprintf("%d", vol.Size)
+    status["volume_id"] = vol.ID
+    status["status"] = vol.Status
 
     return &volume.GetResponse{
         Volume: &volume.Volume{
             Name:       r.Name,
             CreatedAt:  vol.CreatedAt.Format(time.RFC3339),
             Mountpoint: filepath.Join(d.config.MountDir, r.Name),
+            Status: status,
         },
     }, nil
 }
@@ -643,9 +660,19 @@ func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 
     mounted, _ := isMounted(mountPath)
     if !mounted && !d.isNodeDrain() {
-        _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
+        vol, err := d.getByName(r.Name)
         if err != nil {
-            log.Errorf("Auto-mount from Path() failed: %v", err)
+            log.Errorf("Failed to get volume info: %v", err)
+            return &volume.PathResponse{Mountpoint: mountPath}, nil
+        }
+
+        if len(vol.Attachments) == 0 {
+            _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
+            if err != nil {
+                log.Errorf("Auto-mount from Path() failed: %v", err)
+            }
+        } else {
+            log.Infof("Volume %s is attached to another server, skipping auto-mount", r.Name)
         }
     }
 

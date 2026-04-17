@@ -137,7 +137,37 @@ func (d plugin) Capabilities() *volume.CapabilitiesResponse {
 func (d plugin) Create(r *volume.CreateRequest) error {
 	existing, err := d.getByName(r.Name)
     if err == nil && existing != nil {
-        log.Infof("Volume '%s' already exists (ID: %s), skipping create", r.Name, existing.ID)
+        logger := log.WithFields(log.Fields{"name": r.Name, "action": "create"})
+
+        // IMPORTANT: Check if size changed
+        if sizeOpt, ok := r.Options["size"]; ok {
+            expectedSize, _ := strconv.Atoi(sizeOpt)
+            currentSize := existing.Size
+
+            if expectedSize > 0 && expectedSize != currentSize {
+                logger.Warnf("Volume exists but size changed: current=%dGB, new=%dGB",
+                    currentSize, expectedSize)
+
+                // Update metadata to trigger resize on next mount
+                ctx := context.TODO()
+                metadata := existing.Metadata
+                if metadata == nil {
+                    metadata = make(map[string]string)
+                }
+                metadata["expected_size"] = sizeOpt
+
+                _, err := volumes.Update(ctx, d.blockClient, existing.ID, volumes.UpdateOpts{
+                    Metadata: metadata,
+                }).Extract()
+                if err != nil {
+                    logger.Errorf("Failed to update volume metadata: %v", err)
+                } else {
+                    logger.Infof("✓ Updated expected_size to %dGB", expectedSize)
+                }
+            }
+        }
+
+        logger.Infof("Volume '%s' already exists (ID: %s), skipping create", r.Name, existing.ID)
         return nil
     }
 
@@ -148,7 +178,6 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// DEFAULTS
 	size := 10
 	if s, ok := r.Options["size"]; ok {
 		if v, err := strconv.Atoi(s); err == nil {
@@ -156,7 +185,6 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 		}
 	}
 
-	// Parse keyLock argument from docker-compose
 	keyLock := "false"
 	if ad, ok := r.Options["key_lock"]; ok {
 		keyLock = ad
@@ -165,9 +193,22 @@ func (d plugin) Create(r *volume.CreateRequest) error {
 	metadata := map[string]string{
 		"key_lock": keyLock,
 		"docker_volume": "true",
+		"expected_size": strconv.Itoa(size), // Store expected size
 	}
 
-	// Create volume only (do not attach yet)
+	if metaStr, ok := r.Options["meta"]; ok && metaStr != "" {
+        for _, pair := range strings.Split(metaStr, ",") {
+            parts := strings.SplitN(pair, "=", 2)
+            if len(parts) == 2 {
+                key := strings.TrimSpace(parts[0])
+                val := strings.TrimSpace(parts[1])
+                if key != "" {
+                    metadata[key] = val
+                }
+            }
+        }
+    }
+
 	_, err = volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
 		Size: size,
 		Name: r.Name,
@@ -191,18 +232,35 @@ func (d plugin) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
     mountPath := filepath.Join(d.config.MountDir, r.Name)
 
     mounted, _ := isMounted(mountPath)
-    if !mounted && !d.isNodeDrain() {  // ← не монтуємо якщо Drain
-        _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
-        if err != nil {
-            log.Errorf("Auto-mount from Get() failed: %v", err)
+    if !mounted && !d.isNodeDrain() {
+        if len(vol.Attachments) == 0 {
+            _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
+            if err != nil {
+                log.Errorf("Auto-mount from Get() failed: %v", err)
+            }
+        } else {
+            log.Infof("Volume %s is attached to another server, skipping auto-mount", r.Name)
         }
     }
+
+	status := make(map[string]interface{})
+
+    if vol.Metadata != nil {
+        for key, value := range vol.Metadata {
+            status[key] = value
+        }
+    }
+
+    status["actual_size"] = fmt.Sprintf("%d", vol.Size)
+    status["volume_id"] = vol.ID
+    status["status"] = vol.Status
 
     return &volume.GetResponse{
         Volume: &volume.Volume{
             Name:       r.Name,
             CreatedAt:  vol.CreatedAt.Format(time.RFC3339),
             Mountpoint: filepath.Join(d.config.MountDir, r.Name),
+            Status: status,
         },
     }, nil
 }
@@ -248,17 +306,111 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         return nil, fmt.Errorf("Volume not found: %v", err)
     }
 
-    logger.Infof("Volume found: ID=%s, Status=%s, Attachments=%d", vol.ID, vol.Status, len(vol.Attachments))
+    logger.Infof("Volume found: ID=%s, Status=%s, Size=%dGB, Attachments=%d",
+        vol.ID, vol.Status, vol.Size, len(vol.Attachments))
 
+    ctx := context.TODO()
     mountPath := filepath.Join(d.config.MountDir, r.Name)
+    volumeWasResized := false
 
-    // CHECK 1: Is it already mounted on this host?
-    mounted, err := isMounted(mountPath)
+    // ==================== CHECK FOR RESIZE FIRST ====================
+    // IMPORTANT: Check resize BEFORE checking if mounted
+    // Only check expected_size - if it differs from actual size, resize is needed
+    if vol.Metadata != nil {
+        if expectedSizeStr, ok := vol.Metadata["expected_size"]; ok {
+            expectedSize, _ := strconv.Atoi(expectedSizeStr)
+
+            // Only resize if expected_size differs from actual size
+            if expectedSize > 0 && expectedSize != vol.Size {
+                if expectedSize > vol.Size {
+                    logger.Infof("🔄 Resize required: %dGB -> %dGB", vol.Size, expectedSize)
+
+                    // Check if mounted - need to unmount first
+                    mounted, err := isMounted(mountPath)
+                    if err != nil {
+                        logger.Warnf("Failed to check mount status: %v", err)
+                    }
+
+                    if mounted {
+                        logger.Infof("Volume is mounted, unmounting for resize...")
+                        if out, err := exec.Command("umount", mountPath).CombinedOutput(); err != nil {
+                            logger.Errorf("Unmount failed: %s", out)
+                            return nil, fmt.Errorf("failed to unmount before resize: %v", err)
+                        }
+                        logger.Infof("✓ Unmounted successfully")
+                    }
+
+                    // Detach if attached
+                    if len(vol.Attachments) > 0 {
+                        logger.Infof("Detaching volume before resize...")
+                        for _, att := range vol.Attachments {
+                            if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
+                                logger.Errorf("Detach failed: %v", err)
+                                return nil, fmt.Errorf("failed to detach before resize: %v", err)
+                            }
+                        }
+
+                        vol, err = d.waitOnVolumeState(ctx, vol, "available")
+                        if err != nil {
+                            return nil, fmt.Errorf("timeout waiting for available: %v", err)
+                        }
+                    }
+
+                    // Resize volume
+                    logger.Infof("Extending volume to %dGB...", expectedSize)
+                    err = volumes.ExtendSize(ctx, d.blockClient, vol.ID, volumes.ExtendSizeOpts{
+                        NewSize: expectedSize,
+                    }).ExtractErr()
+                    if err != nil {
+                        logger.Errorf("Resize failed: %v", err)
+                        return nil, fmt.Errorf("failed to extend volume: %v", err)
+                    }
+
+                    // Wait for resize completion
+                    logger.Infof("Waiting for resize to complete...")
+                    time.Sleep(5 * time.Second)
+
+                    // CRITICAL: Refresh volume state after resize
+                    vol, err = volumes.Get(ctx, d.blockClient, vol.ID).Extract()
+                    if err != nil {
+                        return nil, fmt.Errorf("failed to get volume after resize: %v", err)
+                    }
+
+                    logger.Infof("✓ Volume resized successfully: %dGB", vol.Size)
+                    volumeWasResized = true
+
+                } else if expectedSize < vol.Size {
+                    logger.Errorf("❌ Volume shrinking not supported! (current=%dGB, expected=%dGB)", vol.Size, expectedSize)
+                    return nil, fmt.Errorf("cannot shrink volume from %dGB to %dGB", vol.Size, expectedSize)
+                }
+            }
+        }
+    }
+    // ==================== END RESIZE CHECK ====================
+
+    // NOW check if already mounted (after resize was handled)
+    isMountedNow, err := isMounted(mountPath)
     if err != nil {
         logger.Warnf("Failed to check mount status: %v", err)
     }
-    if mounted {
+    if isMountedNow {
         logger.Infof("Volume '%s' is already mounted at %s", r.Name, mountPath)
+
+        // If we resized, need to expand filesystem
+        if volumeWasResized {
+            logger.Infof("Expanding filesystem after resize...")
+            out, err := exec.Command("findmnt", "-n", "-o", "SOURCE", mountPath).Output()
+            if err == nil {
+                device := strings.TrimSpace(string(out))
+                logger.Infof("Running resize2fs on %s...", device)
+                if out, err := exec.Command("resize2fs", device).CombinedOutput(); err != nil {
+                    logger.Warnf("Filesystem resize failed: %s", out)
+                } else {
+                    logger.Infof("✓ Filesystem expanded successfully")
+                }
+            }
+        }
+
         return &volume.MountResponse{Mountpoint: mountPath}, nil
     }
 
@@ -269,6 +421,8 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     var attachedToThisInstance bool
     var devicePath string
 
+    // CRITICAL: After resize, vol.Attachments will be empty
+    // So we'll go straight to attach
     if len(vol.Attachments) > 0 {
         logger.Infof("Volume has %d attachment(s)", len(vol.Attachments))
         for i, attachment := range vol.Attachments {
@@ -281,25 +435,22 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                 logger.Infof("✓ Volume %s already attached to THIS instance as %s", vol.ID, devicePath)
                 break
             } else {
-                // Volume is attached to a different instance (or same VM with different machine-id after reboot)
+                // Force detach from other instance
                 logger.Warnf("✗ Volume %s is attached to DIFFERENT server: %s (our ID: %s)",
                     vol.ID, attachment.ServerID, d.config.MachineID)
 
-                // Check instance state before attempting detach
-                // If instance is rebooting, wait for it to complete
                 logger.Infof("→ Checking server %s state before detach...", attachment.ServerID)
-                serverState, err := d.getServerState(context.TODO(), attachment.ServerID)
+                serverState, err := d.getServerState(ctx, attachment.ServerID)
                 if err != nil {
                     logger.Warnf("Could not get server state: %v, attempting detach anyway", err)
                 } else {
                     logger.Infof("Server state: %s, task_state: %s", serverState.Status, serverState.TaskState)
 
-                    // If server is rebooting, wait for it to complete
                     if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
                         logger.Infof("→ Server is rebooting, waiting up to 60s for completion...")
                         for i := 0; i < 60; i++ {
                             time.Sleep(1 * time.Second)
-                            serverState, err = d.getServerState(context.TODO(), attachment.ServerID)
+                            serverState, err = d.getServerState(ctx, attachment.ServerID)
                             if err != nil {
                                 break
                             }
@@ -312,20 +463,16 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                             }
                         }
 
-                        // Check if reboot completed
                         if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
                             logger.Warnf("Server still rebooting after 60s, will try detach anyway")
                         }
                     }
                 }
 
-                // Force detach from other instance
                 logger.Infof("→ Attempting force detach from server %s", attachment.ServerID)
-                ctx := context.TODO()
                 if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
                     logger.Errorf("✗ Detach failed: %v", err)
 
-                    // If detach failed due to instance state, wait and retry
                     if strings.Contains(err.Error(), "task_state") {
                         logger.Infof("→ Detach failed due to instance state, waiting 10s and retrying...")
                         time.Sleep(10 * time.Second)
@@ -346,7 +493,6 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                     return nil, fmt.Errorf("timeout waiting for volume to become available: %v", err)
                 }
                 logger.Infof("✓ Volume is now available")
-                // After detach, vol.Attachments should be empty, so attachedToThisInstance stays false
                 break
             }
         }
@@ -354,23 +500,22 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         logger.Infof("Volume has no attachments (available)")
     }
 
-    // Attach only if not attached to this instance
+    // Attach if not attached to this instance
     if !attachedToThisInstance {
         logger.Infof("Attaching volume %s to instance %s", vol.ID, d.config.MachineID)
         opts := volumeattach.CreateOpts{VolumeID: vol.ID}
-        _, err := volumeattach.Create(context.TODO(), d.computeClient, d.config.MachineID, opts).Extract()
+        _, err := volumeattach.Create(ctx, d.computeClient, d.config.MachineID, opts).Extract()
         if err != nil {
             return nil, fmt.Errorf("Attach failed: %v", err)
         }
 
         logger.Infof("Waiting for volume to reach 'in-use' state")
-        vol, err = d.waitOnVolumeState(context.TODO(), vol, "in-use")
+        vol, err = d.waitOnVolumeState(ctx, vol, "in-use")
         if err != nil {
             return nil, fmt.Errorf("Timeout waiting for volume to attach: %v", err)
         }
         logger.Infof("Volume %s is now in-use", vol.ID)
 
-        // Find the new device
         logger.Infof("Searching for new block device...")
         devicePath, err = findDeviceWithTimeout(existing)
         if err != nil {
@@ -379,17 +524,11 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
             return nil, fmt.Errorf("block device not found for volume %s: %v", vol.ID, err)
         }
     } else {
-        // Volume already attached - need to find which device it is
         logger.Infof("Volume already attached to this instance")
-
-        // ALWAYS search by volume ID (don't trust OpenStack device path)
-        // OpenStack may report /dev/vdb but kernel creates /dev/vde
-        logger.Infof("Searching for device by volume ID (ignoring OpenStack device path)...")
+        logger.Infof("Searching for device by volume ID...")
         devicePath, err = findDeviceByVolumeID(vol.ID)
         if err != nil {
             logger.Errorf("Failed to find device by volume ID: %v", err)
-
-            // Wait a bit and retry (device might not be ready yet)
             logger.Infof("Waiting for device to appear...")
             time.Sleep(2 * time.Second)
             devicePath, err = findDeviceByVolumeID(vol.ID)
@@ -399,31 +538,24 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         }
         logger.Infof("Found device by volume ID: %s", devicePath)
 
-        // Double-check that device is not already mounted elsewhere
-        mounted, mountpoint, _ := isDeviceMounted(devicePath)
-        if mounted {
+        deviceMounted, mountpoint, _ := isDeviceMounted(devicePath)
+        if deviceMounted {
             logger.Warnf("Device %s is already mounted at %s!", devicePath, mountpoint)
-            // If it's mounted to the correct path, just return success
             if mountpoint == mountPath {
                 logger.Infof("Device is already mounted at correct location")
                 return &volume.MountResponse{Mountpoint: mountPath}, nil
             }
-            // If mounted elsewhere, this is an error
             return nil, fmt.Errorf("device %s is already mounted at %s (expected %s)",
                 devicePath, mountpoint, mountPath)
         }
     }
 
     logger.Infof("Using device: %s", devicePath)
-
-    // Wait a bit for device to be fully ready after attach
     time.Sleep(2 * time.Second)
 
-    // Check filesystem type
     fsType, err := getFilesystemType(devicePath)
     if err != nil {
-        logger.Warnf("Error detecting filesystem (device may not be ready): %v", err)
-        // Try waiting a bit more
+        logger.Warnf("Error detecting filesystem: %v", err)
         time.Sleep(3 * time.Second)
         fsType, err = getFilesystemType(devicePath)
         if err != nil {
@@ -433,8 +565,6 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 
     if fsType == "" {
         logger.Infof("No filesystem detected, formatting device %s as ext4", devicePath)
-
-        // Double-check the device is not mounted anywhere before formatting
         out, _ := exec.Command("lsblk", "-no", "MOUNTPOINT", devicePath).CombinedOutput()
         mountpoint := strings.TrimSpace(string(out))
         if mountpoint != "" {
@@ -481,6 +611,17 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
         logger.Warnf("Failed to set permissions: %s", out)
     }
 
+    // ==================== EXPAND FILESYSTEM IF RESIZED ====================
+    if volumeWasResized {
+        logger.Infof("Expanding filesystem on %s after volume resize...", devicePath)
+        if out, err := exec.Command("resize2fs", devicePath).CombinedOutput(); err != nil {
+            logger.Warnf("Filesystem resize failed: %s", out)
+        } else {
+            logger.Infof("✓ Filesystem expanded successfully")
+        }
+    }
+    // ==================== END FILESYSTEM EXPANSION ====================
+
     logger.Infof("Volume '%s' mounted successfully at %s", r.Name, mountPath)
     return &volume.MountResponse{Mountpoint: mountPath}, nil
 }
@@ -519,9 +660,19 @@ func (d plugin) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 
     mounted, _ := isMounted(mountPath)
     if !mounted && !d.isNodeDrain() {
-        _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
+        vol, err := d.getByName(r.Name)
         if err != nil {
-            log.Errorf("Auto-mount from Path() failed: %v", err)
+            log.Errorf("Failed to get volume info: %v", err)
+            return &volume.PathResponse{Mountpoint: mountPath}, nil
+        }
+
+        if len(vol.Attachments) == 0 {
+            _, err := d.Mount(&volume.MountRequest{Name: r.Name, ID: r.Name})
+            if err != nil {
+                log.Errorf("Auto-mount from Path() failed: %v", err)
+            }
+        } else {
+            log.Infof("Volume %s is attached to another server, skipping auto-mount", r.Name)
         }
     }
 

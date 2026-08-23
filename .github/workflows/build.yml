@@ -1,9 +1,14 @@
 name: Build
 
+# `"*"` RAN THIS TWICE per commit on a PR branch — once for the push, once for the pull_request
+# event on the same SHA — and there is no concurrency group here at all, so nothing collapsed them.
+#
+# Note `"*"` was also narrower than it looks: a single `*` matches one path segment, so `feat/x`
+# never matched it and only flat branch names double-ran. `main` is this repo's default branch —
+# unlike the rest of the estate, which is on develop.
 on:
   push:
-    branches:
-      - "*"
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

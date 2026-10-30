@@ -55,6 +55,27 @@ INFO Connected.                                    endpoint="http://api.os.xopic
 
 By default, a `cinder.json` from the current working directory will be used.
 
+### Through the platform's VM broker
+
+On a NimbusNexus cluster machine the plugin holds no OpenStack credential. Set `brokerUrl` instead of
+`endpoint` and the credential fields:
+
+```json
+{
+    "brokerUrl": "http://broker.example.org/api/broker/v1",
+    "vendordataTarget": "broker",
+    "mountDir": "/var/mnt/cinder-volumes"
+}
+```
+
+The plugin reads the machine's token from Nova's dynamic vendordata
+(`http://169.254.169.254/openstack/latest/vendor_data2.json`, under `vendordataTarget`) and sends every
+volume operation to the broker, which checks what the machine may do with the platform's authorization
+rules and acts with its cluster's own credential: only the cluster's volumes, attached only to this
+machine, detached only from a machine of the same cluster. Volume names are the Docker names; the broker
+keeps each cluster's volumes in a namespace of its own. Everything else — finding the device, formatting,
+mounting, resizing — works as with a credential.
+
 ## Usage
 
 The default volume size is 10 GB but can be overridden:

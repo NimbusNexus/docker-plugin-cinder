@@ -33,6 +33,11 @@ type tConfig struct {
 	Region                      string `json:"region,omitempty"`
 	MachineID                   string `json:"machineID,omitempty"`
 	MountDir                    string `json:"mountDir,omitempty"`
+	// The platform's VM broker. When set, the plugin holds no OpenStack credential: it proves
+	// which server it is with the token Nova's vendordata hands it, and the broker does the rest.
+	BrokerURL string `json:"brokerUrl,omitempty"`
+	// The broker target's name in nova.conf: the key of its entry in vendor_data2.json.
+	VendordataTarget string `json:"vendordataTarget,omitempty"`
 }
 
 func init() {
@@ -101,6 +106,22 @@ func main() {
 		log.Fatal("No mountDir configured. Abort.")
 	}
 
+	var b backend
+	if config.BrokerURL != "" {
+		b, err = newBrokerBackend(&config)
+		if err != nil {
+			log.WithError(err).Fatal(err.Error())
+		}
+	} else {
+		b = connectOpenstack(&config)
+	}
+
+	serve(newPlugin(b, &config))
+}
+
+// connectOpenstack is the plugin's original mode: Cinder and Nova directly, with the credential in
+// the config file.
+func connectOpenstack(config *tConfig) backend {
 	if config.IdentityEndpoint == "" {
 		log.Fatal("Identity endpoint missing")
 	}
@@ -131,15 +152,17 @@ func main() {
 		Region: config.Region,
 	}
 
-	plugin, err := newPlugin(provider, endpointOpts, &config)
-
+	b, err := newOpenstackBackend(provider, endpointOpts, config)
 	if err != nil {
 		logger.WithError(err).Fatal(err.Error())
 	}
-
-	handler := volume.NewHandler(plugin)
-
 	logger.Info("Connected.")
+	return b
+}
+
+func serve(p *plugin) {
+	logger := log.WithField("plugin", "cinder")
+	handler := volume.NewHandler(p)
 
 	listeners, err := activation.Listeners()
 

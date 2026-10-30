@@ -2,11 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,117 +12,20 @@ import (
 	"sync"
 	"time"
 
-	uuid "github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/docker/go-plugins-helpers/volume"
-	"github.com/gophercloud/gophercloud/v2"
-	"github.com/gophercloud/gophercloud/v2/openstack"
-	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
-	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/volumeattach"
-	"github.com/gophercloud/gophercloud/v2/pagination"
 )
 
 type plugin struct {
-	blockClient   *gophercloud.ServiceClient
-	computeClient *gophercloud.ServiceClient
-	config        *tConfig
-	mutex         *sync.Mutex
+	backend backend
+	config  *tConfig
+	mutex   *sync.Mutex
 }
 
-func newPlugin(provider *gophercloud.ProviderClient, endpointOpts gophercloud.EndpointOpts, config *tConfig) (*plugin, error) {
-	log.Infof("Discovering OpenStack endpoints...")
-	log.Infof("EndpointOpts: Region=%s, Availability=%s", endpointOpts.Region, endpointOpts.Availability)
-
-	// Try to create block storage client
-	blockClient, err := openstack.NewBlockStorageV3(provider, endpointOpts)
-	if err != nil {
-		log.Errorf("Failed to discover block storage endpoint using standard method: %v", err)
-		identityEndpoint := provider.IdentityEndpoint
-
-		parts := strings.SplitN(identityEndpoint, "://", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid identity endpoint format: %s", identityEndpoint)
-		}
-		scheme := parts[0]
-		hostAndPath := parts[1]
-
-		hostParts := strings.SplitN(hostAndPath, "/", 2)
-		host := hostParts[0]
-
-		cinderURL := fmt.Sprintf("%s://%s/volume/v3", scheme, host)
-
-		log.Infof("Attempting manual endpoint construction: %s", cinderURL)
-
-		blockClient = &gophercloud.ServiceClient{
-			ProviderClient: provider,
-			Endpoint:       cinderURL,
-			Type:           "block-storage",
-		}
-
-		// ResourceBase should have the trailing slash for proper path construction
-		blockClient.ResourceBase = cinderURL + "/"
-
-		log.Infof("Manually constructed block storage client - Endpoint: %s, ResourceBase: %s",
-			blockClient.Endpoint, blockClient.ResourceBase)
-	} else {
-		log.Infof("Block storage endpoint discovered: %s", blockClient.Endpoint)
-	}
-
-	computeClient, err := openstack.NewComputeV2(provider, endpointOpts)
-	if err != nil {
-		log.Errorf("Failed to discover compute endpoint: %v", err)
-		return nil, fmt.Errorf("failed to create compute client: %v", err)
-	}
-	log.Infof("Compute endpoint discovered: %s", computeClient.Endpoint)
-
-	if config.MachineID == "" {
-		// Try to get instance UUID from OpenStack metadata first (most reliable)
-		machineID, err := getInstanceIDFromMetadata()
-		if err == nil && machineID != "" {
-			config.MachineID = machineID
-			log.Infof("Using instance ID from OpenStack metadata: %s", machineID)
-		} else {
-			// Fallback to /etc/machine-id
-			log.Warnf("Could not get instance ID from metadata: %v, falling back to /etc/machine-id", err)
-			bytes, err := os.ReadFile("/etc/machine-id")
-			if err != nil {
-				return nil, err
-			}
-
-			machineIDStr := strings.TrimSpace(string(bytes))
-
-			// /etc/machine-id might be in format without dashes (32 hex chars)
-			// OpenStack expects UUID format with dashes
-			if len(machineIDStr) == 32 && !strings.Contains(machineIDStr, "-") {
-				// Convert to UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-				machineIDStr = fmt.Sprintf("%s-%s-%s-%s-%s",
-					machineIDStr[0:8],
-					machineIDStr[8:12],
-					machineIDStr[12:16],
-					machineIDStr[16:20],
-					machineIDStr[20:32])
-				log.Infof("Converted machine-id to UUID format: %s", machineIDStr)
-			}
-
-			// Validate it's a proper UUID
-			id, err := uuid.FromString(machineIDStr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid machine-id format: %v", err)
-			}
-			config.MachineID = id.String()
-			log.Infof("Using machine-id: %s", config.MachineID)
-		}
-	}
-
-	log.Infof("Plugin initialized with MachineID: %s", config.MachineID)
-
-	return &plugin{
-		blockClient:   blockClient,
-		computeClient: computeClient,
-		config:        config,
-		mutex:         &sync.Mutex{},
-	}, nil
+func newPlugin(b backend, config *tConfig) *plugin {
+	log.Infof("Plugin initialized with MachineID: %s", b.MachineID())
+	return &plugin{backend: b, config: config, mutex: &sync.Mutex{}}
 }
 
 func (d plugin) Capabilities() *volume.CapabilitiesResponse {
@@ -156,9 +56,7 @@ func (d plugin) Create(r *volume.CreateRequest) error {
                 }
                 metadata["expected_size"] = sizeOpt
 
-                _, err := volumes.Update(ctx, d.blockClient, existing.ID, volumes.UpdateOpts{
-                    Metadata: metadata,
-                }).Extract()
+                err := d.backend.SetMetadata(ctx, existing, metadata)
                 if err != nil {
                     logger.Errorf("Failed to update volume metadata: %v", err)
                 } else {
@@ -209,11 +107,7 @@ func (d plugin) Create(r *volume.CreateRequest) error {
         }
     }
 
-	_, err = volumes.Create(ctx, d.blockClient, volumes.CreateOpts{
-		Size: size,
-		Name: r.Name,
-		Metadata: metadata,
-	}, volumes.SchedulerHintOpts{}).Extract()
+	err = d.backend.Create(ctx, r.Name, size, metadata)
 	if err != nil {
 		return fmt.Errorf("Volume create failed: %v", err)
 	}
@@ -270,33 +164,27 @@ func (d plugin) List() (*volume.ListResponse, error) {
 	ctx := context.TODO()
 	var vols []*volume.Volume
 
-	pager := volumes.List(d.blockClient, volumes.ListOpts{})
-	_ = pager.EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
-		vList, _ := volumes.ExtractVolumes(page)
-		for _, v := range vList {
-			if v.Name != "" {
-				vols = append(vols, &volume.Volume{
-					Name:      v.Name,
-					CreatedAt: v.CreatedAt.Format(time.RFC3339),
-				})
-			}
+	listed, err := d.backend.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range listed {
+		if v.Name != "" {
+			vols = append(vols, &volume.Volume{
+				Name:      v.Name,
+				CreatedAt: v.CreatedAt.Format(time.RFC3339),
+			})
 		}
-		return true, nil
-	})
+	}
 
 	return &volume.ListResponse{Volumes: vols}, nil
 }
 
 func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
-	freshID, err := getInstanceIDFromMetadata()
-    if err == nil && freshID != "" && freshID != d.config.MachineID {
-        log.Warnf("MachineID mismatch! config=%s metadata=%s, updating...",
-            d.config.MachineID, freshID)
-        d.config.MachineID = freshID
-    }
+	machineID := d.backend.MachineID()
 
     logger := log.WithFields(log.Fields{"name": r.Name, "action": "mount"})
-    logger.Infof("Mounting volume '%s' (our machine-id: %s)", r.Name, d.config.MachineID)
+    logger.Infof("Mounting volume '%s' (our machine-id: %s)", r.Name, machineID)
 
     d.mutex.Lock()
     defer d.mutex.Unlock()
@@ -344,7 +232,7 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                     if len(vol.Attachments) > 0 {
                         logger.Infof("Detaching volume before resize...")
                         for _, att := range vol.Attachments {
-                            if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
+                            if err := d.detachWithRetry(ctx, vol, att.ServerID); err != nil {
                                 logger.Errorf("Detach failed: %v", err)
                                 return nil, fmt.Errorf("failed to detach before resize: %v", err)
                             }
@@ -358,9 +246,7 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 
                     // Resize volume
                     logger.Infof("Extending volume to %dGB...", expectedSize)
-                    err = volumes.ExtendSize(ctx, d.blockClient, vol.ID, volumes.ExtendSizeOpts{
-                        NewSize: expectedSize,
-                    }).ExtractErr()
+                    err = d.backend.Extend(ctx, vol, expectedSize)
                     if err != nil {
                         logger.Errorf("Resize failed: %v", err)
                         return nil, fmt.Errorf("failed to extend volume: %v", err)
@@ -371,7 +257,7 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
                     time.Sleep(5 * time.Second)
 
                     // CRITICAL: Refresh volume state after resize
-                    vol, err = volumes.Get(ctx, d.blockClient, vol.ID).Extract()
+                    vol, err = d.backend.Refresh(ctx, vol)
                     if err != nil {
                         return nil, fmt.Errorf("failed to get volume after resize: %v", err)
                     }
@@ -426,10 +312,10 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
     if len(vol.Attachments) > 0 {
         logger.Infof("Volume has %d attachment(s)", len(vol.Attachments))
         for i, attachment := range vol.Attachments {
-            logger.Infof("Attachment %d: server_id=%s, device=%s, attachment_id=%s",
-                i, attachment.ServerID, attachment.Device, attachment.ID)
+            logger.Infof("Attachment %d: server_id=%s, device=%s",
+                i, attachment.ServerID, attachment.Device)
 
-            if attachment.ServerID == d.config.MachineID {
+            if attachment.ServerID == machineID {
                 attachedToThisInstance = true
                 devicePath = attachment.Device
                 logger.Infof("✓ Volume %s already attached to THIS instance as %s", vol.ID, devicePath)
@@ -437,52 +323,14 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
             } else {
                 // Force detach from other instance
                 logger.Warnf("✗ Volume %s is attached to DIFFERENT server: %s (our ID: %s)",
-                    vol.ID, attachment.ServerID, d.config.MachineID)
+                    vol.ID, attachment.ServerID, machineID)
 
-                logger.Infof("→ Checking server %s state before detach...", attachment.ServerID)
-                serverState, err := d.getServerState(ctx, attachment.ServerID)
-                if err != nil {
-                    logger.Warnf("Could not get server state: %v, attempting detach anyway", err)
-                } else {
-                    logger.Infof("Server state: %s, task_state: %s", serverState.Status, serverState.TaskState)
-
-                    if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
-                        logger.Infof("→ Server is rebooting, waiting up to 60s for completion...")
-                        for i := 0; i < 60; i++ {
-                            time.Sleep(1 * time.Second)
-                            serverState, err = d.getServerState(ctx, attachment.ServerID)
-                            if err != nil {
-                                break
-                            }
-                            if serverState.TaskState == "" || serverState.TaskState == "none" {
-                                logger.Infof("✓ Server reboot completed (state: %s)", serverState.Status)
-                                break
-                            }
-                            if i%10 == 0 {
-                                logger.Infof("Still waiting... (task_state: %s)", serverState.TaskState)
-                            }
-                        }
-
-                        if serverState.TaskState == "reboot_started" || serverState.TaskState == "rebooting" {
-                            logger.Warnf("Server still rebooting after 60s, will try detach anyway")
-                        }
-                    }
-                }
-
-                logger.Infof("→ Attempting force detach from server %s", attachment.ServerID)
-                if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
+                // The server holding it may still be rebooting: the service refuses with a
+                // conflict until it is done, and the detach is retried for a while.
+                logger.Infof("→ Detaching from server %s", attachment.ServerID)
+                if err := d.detachWithRetry(ctx, vol, attachment.ServerID); err != nil {
                     logger.Errorf("✗ Detach failed: %v", err)
-
-                    if strings.Contains(err.Error(), "task_state") {
-                        logger.Infof("→ Detach failed due to instance state, waiting 10s and retrying...")
-                        time.Sleep(10 * time.Second)
-                        if err := volumeattach.Delete(ctx, d.computeClient, attachment.ServerID, attachment.ID).ExtractErr(); err != nil {
-                            return nil, fmt.Errorf("failed to detach volume from server %s after retry: %v", attachment.ServerID, err)
-                        }
-                        logger.Infof("✓ Detach succeeded on retry")
-                    } else {
-                        return nil, fmt.Errorf("failed to detach volume from server %s: %v", attachment.ServerID, err)
-                    }
+                    return nil, fmt.Errorf("failed to detach volume from server %s: %v", attachment.ServerID, err)
                 }
                 logger.Infof("✓ Detached successfully")
 
@@ -502,9 +350,8 @@ func (d plugin) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 
     // Attach if not attached to this instance
     if !attachedToThisInstance {
-        logger.Infof("Attaching volume %s to instance %s", vol.ID, d.config.MachineID)
-        opts := volumeattach.CreateOpts{VolumeID: vol.ID}
-        _, err := volumeattach.Create(ctx, d.computeClient, d.config.MachineID, opts).Extract()
+        logger.Infof("Attaching volume %s to instance %s", vol.ID, machineID)
+        err := d.backend.Attach(ctx, vol)
         if err != nil {
             return nil, fmt.Errorf("Attach failed: %v", err)
         }
@@ -727,8 +574,8 @@ func (d plugin) Remove(r *volume.RemoveRequest) error {
         logger.Infof("Volume has %d attachment(s), detaching...", len(vol.Attachments))
 
         for _, att := range vol.Attachments {
-            logger.Infof("Detaching from server %s (attachment ID: %s)", att.ServerID, att.ID)
-            if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
+            logger.Infof("Detaching from server %s", att.ServerID)
+            if err := d.detachWithRetry(ctx, vol, att.ServerID); err != nil {
                 logger.Errorf("Detach failed: %v", err)
                 return fmt.Errorf("failed to detach volume: %v", err)
             }
@@ -747,7 +594,7 @@ func (d plugin) Remove(r *volume.RemoveRequest) error {
     }
 
     logger.Infof("Deleting volume %s from OpenStack", vol.ID)
-    if err := volumes.Delete(ctx, d.blockClient, vol.ID, volumes.DeleteOpts{}).ExtractErr(); err != nil {
+    if err := d.backend.Delete(ctx, vol); err != nil {
         logger.Errorf("Delete failed: %v", err)
         return fmt.Errorf("failed to delete volume: %v", err)
     }
@@ -781,37 +628,29 @@ func (d plugin) Unmount(r *volume.UnmountRequest) error {
     return nil
 }
 
-func (d plugin) getByName(name string) (*volumes.Volume, error) {
-	var vol *volumes.Volume
-	ctx := context.TODO()
-	pager := volumes.List(d.blockClient, volumes.ListOpts{Name: name})
-	err := pager.EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
-		vList, _ := volumes.ExtractVolumes(page)
-		for _, v := range vList {
-			if v.Name == name {
-				vol = &v
-				return false, nil
-			}
-		}
-		return true, nil
-	})
-
-	if vol == nil || vol.ID == "" {
-		return nil, errors.New("Not Found")
-	}
-	return vol, err
+func (d plugin) getByName(name string) (*cinderVolume, error) {
+	return d.backend.GetByName(context.TODO(), name)
 }
 
-func (d plugin) detachVolume(ctx context.Context, vol *volumes.Volume) (*volumes.Volume, error) {
-	for _, att := range vol.Attachments {
-		if err := volumeattach.Delete(ctx, d.computeClient, att.ServerID, att.ID).ExtractErr(); err != nil {
-			return nil, err
+// How long, and how often, a detach refused for now is tried again.
+var detachRetryFor = 60 * time.Second
+var detachRetryInterval = 10 * time.Second
+
+// detachWithRetry detaches the volume from serverID, retrying while the service answers with a
+// conflict — the server is rebooting, the volume is busy — for up to a minute.
+func (d plugin) detachWithRetry(ctx context.Context, vol *cinderVolume, serverID string) error {
+	deadline := time.Now().Add(detachRetryFor)
+	for {
+		err := d.backend.Detach(ctx, vol, serverID)
+		if err == nil || !errors.Is(err, errConflict) || time.Now().After(deadline) {
+			return err
 		}
+		log.Infof("Detach from %s refused for now (%v), retrying in %s", serverID, err, detachRetryInterval)
+		time.Sleep(detachRetryInterval)
 	}
-	return vol, nil
 }
 
-func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, status string) (*volumes.Volume, error) {
+func (d plugin) waitOnVolumeState(ctx context.Context, vol *cinderVolume, status string) (*cinderVolume, error) {
     if vol.Status == status {
         return vol, nil
     }
@@ -828,7 +667,7 @@ func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, stat
             return vol, fmt.Errorf("volume %s did not reach status %s within 60s (last status: %s)",
                 vol.ID, status, vol.Status)
         case <-ticker.C:
-            updated, err := volumes.Get(ctx, d.blockClient, vol.ID).Extract()
+            updated, err := d.backend.Refresh(ctx, vol)
             if err != nil {
                 log.Warnf("Error getting volume status: %v", err)
                 continue
@@ -845,52 +684,4 @@ func (d plugin) waitOnVolumeState(ctx context.Context, vol *volumes.Volume, stat
             }
         }
     }
-}
-
-// ServerState represents the state of a compute instance
-type ServerState struct {
-    Status    string
-    TaskState string
-}
-
-// getServerState retrieves the current state of a compute instance
-func (d plugin) getServerState(ctx context.Context, serverID string) (*ServerState, error) {
-    type serverResponse struct {
-        Server struct {
-            Status    string `json:"status"`
-            TaskState string `json:"OS-EXT-STS:task_state"`
-        } `json:"server"`
-    }
-
-    url := fmt.Sprintf("%s/servers/%s", d.computeClient.ResourceBase, serverID)
-
-    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-    if err != nil {
-        return nil, err
-    }
-
-    req.Header.Set("X-Auth-Token", d.computeClient.Token())
-    req.Header.Set("Accept", "application/json")
-
-    client := &http.Client{Timeout: 5 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-
-    if resp.StatusCode != 200 {
-        body, _ := io.ReadAll(resp.Body)
-        return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-    }
-
-    var data serverResponse
-    if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-        return nil, err
-    }
-
-    return &ServerState{
-        Status:    data.Server.Status,
-        TaskState: data.Server.TaskState,
-    }, nil
 }
